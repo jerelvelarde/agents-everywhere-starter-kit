@@ -45,6 +45,8 @@ Your project and its core functionality must be created during the event. Existi
 
 Three starting points for different kinds of context. **CopilotKit Channels** brings the Slack agent into the conversation; **CopilotKit React** connects the web agent to the app people are using.
 
+**Every template supports OpenAI directly or OpenRouter.** Each guide includes both configurations; use `MODEL_PROVIDER`, the selected provider's API key, and `MODEL`. [Choose a model provider →](dev-docs/model-switching.md)
+
 ### 1. Slack — an agent that joins the thread
 
 **OpenAI + CopilotKit Channels + Exa**
@@ -67,11 +69,11 @@ The included web app supplies page context, frontend tools, and agent-rendered U
 
 ### 3. WhatsApp — an agent you can text
 
-**OpenAI Agents SDK + Auth0**
+**OpenAI Agents SDK + CopilotKit Channels + Auth0**
 
 An agent recognizes a linked user and requests approval on their phone before executing a protected action. The included app saves an approved, named request and returns a receipt in the conversation. Adapt that action to your own assistant.
 
-This is an independent app with its own install and configuration. It uses OpenAI Agents SDK directly, Auth0 for identity and approval, and a WhatsApp transport. No CopilotKit account is required for this template.
+This app has its own install and configuration. CopilotKit Channels connects directly to Meta's WhatsApp Cloud API, OpenAI Agents SDK proposes the action using OpenAI or OpenRouter, and Auth0 verifies identity and phone approval. Setup requires Meta, CopilotKit Intelligence, your model provider, and an Auth0 tenant with CIBA access.
 
 **[Use the WhatsApp template →](templates/whatsapp.md)**
 

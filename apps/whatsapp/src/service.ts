@@ -1,32 +1,40 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import express from 'express';
-import twilio from 'twilio';
 import { z } from 'zod';
 import { Auth0 } from './auth0.js';
 import { DiagnosticError, reportError } from './diagnostics.js';
 import { createPlanner, proposalSchema, type PlannerInput, type Proposal } from './agent.js';
 import { Store, type Approval } from './store.js';
+import { whatsappWebhookProxy } from './webhook-proxy.js';
 export type { Proposal } from './agent.js';
 export type Config = {
   publicBaseUrl: string; issuer: string; clientId: string; clientSecret: string; audience: string;
-  twilioAccountSid: string; twilioAuthToken: string; whatsappFrom: string; dataFile: string; model: string; port: number;
+  whatsappAccessToken: string; whatsappPhoneNumberId: string; whatsappAppSecret: string; whatsappVerifyToken: string;
+  whatsappWebhookPort: number; whatsappApiVersion: string; channelName: string; intelligenceApiKey: string;
+  dataFile: string; model: string; modelProvider: 'openai' | 'openrouter'; modelApiKey: string; port: number;
 };
 const random = () => randomBytes(32).toString('base64url');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const same = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const labelSchema = z.string().regex(/^[A-Za-z0-9_-]{1,24}$/);
 const binding = (action: Approval) => `Save:${action.label}:#${action.id}`;
+// Allowed labels and generated IDs cannot contain backticks. Channels preserves
+// code spans verbatim, so WhatsApp displays the same literal values as Guardian.
+const literal = (value: string) => `\`${value}\``;
 const actionHash = (action: Pick<Approval, 'id' | 'from' | 'sub' | 'label'>) => hash(JSON.stringify([action.id, action.from, action.sub, action.label]));
 
+export type IntakeMessage = { id: string; from: string; body: string };
+export type SendReply = (from: string, body: string) => Promise<void>;
 export function createService(config: Config, options: {
-  planner?: (input: PlannerInput) => Promise<Proposal>; now?: () => number; twilioApiBaseUrl?: string;
+  sendReply: SendReply;
+  planner?: (input: PlannerInput) => Promise<Proposal>; now?: () => number;
   reportError?: (operation: string, error: unknown) => void;
-} = {}) {
+}) {
   const app = express();
   app.disable('x-powered-by');
-  const store = new Store(config.dataFile);
+  const store = new Store(config.dataFile, config.whatsappPhoneNumberId);
   const auth = new Auth0(config);
-  const plan = options.planner ?? createPlanner(config.model);
+  const plan = options.planner ?? createPlanner(config);
   const now = options.now ?? Date.now;
   const report = options.reportError ?? reportError;
   let ticking = false;
@@ -37,27 +45,20 @@ export function createService(config: Config, options: {
     res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'" });
     next();
   });
+  app.use(whatsappWebhookProxy(config, report));
   app.get('/health', (_req, res) => res.json({ ok: true }));
-  app.get('/', (_req, res) => res.type('text').send('WhatsApp + OpenAI Agents SDK + Auth0. Start by texting the configured WhatsApp sandbox.'));
-  app.post('/webhooks/whatsapp', express.urlencoded({ extended: false, limit: '16kb', parameterLimit: 100 }), (req, res) => {
-    const params = z.record(z.string(), z.string()).safeParse(req.body);
-    const signature = req.get('x-twilio-signature') ?? '';
-    if (!params.success || !twilio.validateRequest(config.twilioAuthToken, signature, `${config.publicBaseUrl}/webhooks/whatsapp`, params.data)) {
-      res.status(403).send('Invalid webhook signature'); return;
-    }
-    const parsed = z.object({
-      MessageSid: z.string().regex(/^SM[0-9a-fA-F]{32}$/), From: z.string().regex(/^whatsapp:\+[1-9][0-9]{7,14}$/),
-      To: z.literal(config.whatsappFrom), AccountSid: z.literal(config.twilioAccountSid), Body: z.string().max(4000),
-    }).safeParse(params.data);
-    if (!parsed.success || req.originalUrl !== '/webhooks/whatsapp') { res.status(400).send('Invalid WhatsApp message'); return; }
-    const { MessageSid, From, Body } = parsed.data;
-    if (!store.data.inbox[MessageSid]) {
-      store.data.inbox[MessageSid] = { from: From, body: Body.trim(), receivedAt: now(), status: 'queued' };
-      store.save();
-    }
-    // Acknowledge quickly. The single-process worker handles the model and outbound REST calls.
-    res.type('text/xml').send('<Response/>');
+  app.get('/', (_req, res) => res.type('text').send('WhatsApp + OpenAI Agents SDK + Auth0. Start by texting the configured Meta WhatsApp number.'));
+  // Internal capability only. The Channels handler calls this after signed provider intake.
+  const intakeSchema = z.object({
+    id: z.string().regex(/^wamid\.[A-Za-z0-9+/=_-]+$/).max(512),
+    from: z.string().regex(/^[1-9][0-9]{7,14}$/), body: z.string().min(1).max(4000),
   });
+  function receive(message: IntakeMessage) {
+    const { id, from, body } = intakeSchema.parse(message);
+    if (store.data.inbox[id]) return;
+    store.data.inbox[id] = { from, body: body.trim(), receivedAt: now(), status: 'queued' };
+    store.save();
+  }
 
   app.get('/link/:token', (req, res) => {
     const link = store.data.links[hash(req.params.token)];
@@ -132,7 +133,7 @@ export function createService(config: Config, options: {
     }
     const actions = Object.values(store.data.approvals).filter((action) => action.from === from).sort((a, b) => b.createdAt - a.createdAt);
     if (body.toUpperCase() === 'STATUS') {
-      const lines = actions.slice(0, 5).map((action) => `${action.id}: ${action.label} — ${action.status}`);
+      const lines = actions.slice(0, 5).map((action) => literal(`${action.id}: ${action.label} — ${action.status}`));
       reply(from, `Connected as ${identity.name}.\n${lines.length ? lines.join('\n') : 'No requests yet.'}`); return;
     }
     if (actions.some((action) => ['pending', 'initiating'].includes(action.status))) {
@@ -155,7 +156,7 @@ export function createService(config: Config, options: {
         action.authReqId = start.auth_req_id; action.status = 'pending';
         action.expiresAt = Math.min(action.expiresAt, now() + start.expires_in * 1000);
         action.interval = Math.max(5, start.interval); action.nextPollAt = now() + action.interval * 1000;
-        reply(from, `Approve saving the local demo request "${label}" in Auth0 Guardian. Match this exact message:\n${binding(action)}\nNo record is saved until approval. This expires within 5 minutes. You may deny it on your phone.`);
+        reply(from, `Approve saving the local demo request ${literal(label)} in Auth0 Guardian. Match this exact message:\n${literal(binding(action))}\nNo record is saved until approval. This expires within 5 minutes. You may deny it on your phone.`);
       } catch (error) {
         action.status = 'failed'; report('Approval initiation failed', error);
         reply(from, `Approval for ${action.id} could not be started. Nothing was saved. Check Auth0 CIBA configuration and Guardian enrollment, then try again.`);
@@ -189,7 +190,7 @@ export function createService(config: Config, options: {
       labelSchema.parse(action.label);
       store.data.records[action.id] = { id: action.id, sub: action.sub, label: action.label, createdAt: now() };
       action.status = 'saved';
-      reply(action.from, `Saved request "${action.label}" with ID ${action.id}, after your Auth0 approval. This is a local demo record; no external purchase or booking was made.`);
+      reply(action.from, `Saved request ${literal(action.label)} with ID ${action.id}, after your Auth0 approval. This is a local demo record; no external purchase or booking was made.`);
     } catch (error) {
       action.status = 'failed'; report('Approval verification failed', error);
       reply(action.from, `Request ${action.id} failed verification. Nothing was saved. Check the app log and Auth0 API permission, then send a new request.`);
@@ -200,18 +201,10 @@ export function createService(config: Config, options: {
     for (const message of Object.values(store.data.outbox)) {
       if (message.status !== 'queued') continue;
       const recent = Object.values(store.data.inbox).some((item) => item.from === message.from && item.receivedAt > now() - 24 * 60 * 60 * 1000);
-      if (!recent) { message.status = 'failed'; report('WhatsApp reply skipped', new DiagnosticError('CUSTOMER_SERVICE_WINDOW_CLOSED')); continue; }
+      if (!recent) { message.status = 'failed'; store.save(); report('WhatsApp reply skipped', new DiagnosticError('CUSTOMER_SERVICE_WINDOW_CLOSED')); continue; }
       message.status = 'sending'; store.save();
       try {
-        const response = await fetch(`${options.twilioApiBaseUrl ?? 'https://api.twilio.com'}/2010-04-01/Accounts/${config.twilioAccountSid}/Messages.json`, {
-          method: 'POST', headers: {
-            authorization: `Basic ${Buffer.from(`${config.twilioAccountSid}:${config.twilioAuthToken}`).toString('base64')}`,
-            'content-type': 'application/x-www-form-urlencoded',
-          }, body: new URLSearchParams({ From: config.whatsappFrom, To: message.from, Body: message.body }),
-          signal: AbortSignal.timeout(10_000), redirect: 'error',
-        });
-        if (!response.ok) throw new DiagnosticError('TWILIO_SEND_FAILED', response.status);
-        z.object({ sid: z.string().min(1) }).parse(await response.json());
+        await options.sendReply(message.from, message.body);
         message.status = 'sent';
       } catch (error) {
         message.status = 'failed'; report('WhatsApp reply failed; send STATUS to recover', error);
@@ -237,5 +230,5 @@ export function createService(config: Config, options: {
   app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     report('HTTP request failed', error); res.status(500).type('text').send('Request failed');
   });
-  return { app, store, tick };
+  return { app, store, tick, receive };
 }
